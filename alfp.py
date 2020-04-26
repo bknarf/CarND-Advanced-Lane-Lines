@@ -112,63 +112,24 @@ class Camera:
         )
 
 
-class Sobel:
-
-    def abs_sobel_thresh(img_1c, orient='x', thresh_min=0, thresh_max=255):
-        # Apply x or y gradient with the OpenCV Sobel() function
-        # and take the absolute value
-        if orient == 'x':
-            abs_sobel = np.absolute(cv2.Sobel(img_1c, cv2.CV_64F, 1, 0))
-        if orient == 'y':
-            abs_sobel = np.absolute(cv2.Sobel(img_1c, cv2.CV_64F, 0, 1))
-        # Rescale back to 8 bit integer
-        scaled_sobel = np.uint8(255 * abs_sobel / np.max(abs_sobel))
-        # Create a copy and apply the threshold
-        binary_output = np.zeros_like(scaled_sobel)
-        # Here I'm using inclusive (>=, <=) thresholds, but exclusive is ok too
-        binary_output[(scaled_sobel >= thresh_min) & (scaled_sobel <= thresh_max)] = 1
-
-        # Return the result
-        return binary_output
-
-    # Define a function to return the magnitude of the gradient
-    # for a given sobel kernel size and threshold values
-    def mag_thresh(img_1c, sobel_kernel=3, mag_thresh=(0, 255)):
-        # Take both Sobel x and y gradients
-        sobelx = cv2.Sobel(img_1c, cv2.CV_64F, 1, 0, ksize=sobel_kernel)
-        sobely = cv2.Sobel(img_1c, cv2.CV_64F, 0, 1, ksize=sobel_kernel)
-        # Calculate the gradient magnitude
-        gradmag = np.sqrt(sobelx ** 2 + sobely ** 2)
-        # Rescale to 8 bit
-        scale_factor = np.max(gradmag) / 255
-        gradmag = (gradmag / scale_factor).astype(np.uint8)
-        # Create a binary image of ones where threshold is met, zeros otherwise
-        binary_output = np.zeros_like(gradmag)
-        binary_output[(gradmag >= mag_thresh[0]) & (gradmag <= mag_thresh[1])] = 1
-
-        # Return the binary image
-        return binary_output
-
-    # Define a function to threshold an image for a given range and Sobel kernel
-    def dir_threshold(img_1c, sobel_kernel=3, thresh=(0, np.pi / 2)):
-        # Calculate the x and y gradients
-        sobelx = cv2.Sobel(img_1c, cv2.CV_64F, 1, 0, ksize=sobel_kernel)
-        sobely = cv2.Sobel(img_1c, cv2.CV_64F, 0, 1, ksize=sobel_kernel)
-        # Take the absolute value of the gradient direction,
-        # apply a threshold, and create a binary image result
-        absgraddir = np.arctan2(np.absolute(sobely), np.absolute(sobelx))
-        binary_output = np.zeros_like(absgraddir)
-        binary_output[(absgraddir >= thresh[0]) & (absgraddir <= thresh[1])] = 1
-
-        # Return the binary image
-        return binary_output
-
-
 class Pipeline:
     def __init__(self, config):
 
         # just for reference and debugging
         self.config = config
+
+        self.poly_summary = []
+        self.diverging_lanes_frames = False
+        self.low_detection_frames = False
+        self.invalid_lane_frames = False
+        self.no_lane_frames = False
+        self.one_lane_frames = False
+        self.converging_lanes_frames = False
+        self.converging_lanes_threshold = config["converging_lanes_threshold"]
+        self.diverging_lanes_frames = False
+        self.diverging_lanes_threshold = config["diverging_lanes_threshold"]
+
+        self.frames_of_interest_summary = {}
 
         self.camera = Camera(**config["camera"])
         self.series_name = False
@@ -184,16 +145,15 @@ class Pipeline:
         self.ploty = False
 
         self.remember_results = config["remember_results"]
-        self.expire_results= config["expire_results"]
+        self.expire_results = config["expire_results"]
         self.expire_confidence = config["expire_results"]
 
         self.max_detection = config["max_detection"]
-        self.detected = []
+        self.min_detection = config["min_detection"]
 
         self.search_poly_threshold = config["search_poly_threshold"]
 
         self.results = False
-
 
         self.naive_windows = config["naive_windows"]
         self.naive_margin = config["naive_margin"]
@@ -203,12 +163,17 @@ class Pipeline:
         self.naive_polyline_color = config["naive_polyline_color"]
 
         self.poly_margin = config["poly_margin"]
-        self.poly_search_color=config["poly_search_color"]
-        self.poly_side_color=config["poly_side_color"]
-        self.poly_polyline_color=config["poly_polyline_color"]
+        self.poly_search_color = config["poly_search_color"]
+        self.poly_side_color = config["poly_side_color"]
+        self.poly_polyline_color = config["poly_polyline_color"]
 
+        self.curvature_font = config["curvature_font"]
+        self.curvature_font_scale = config["curvature_font_scale"]
+        self.curvature_ym_per_pix = config["curvature_ym_per_pix"]
+        self.curvature_xm_per_pix = config["curvature_xm_per_pix"]
 
         self.trapezoid = np.array(config["trapezoid"])
+        self.region_of_interest_offsets = config["region_of_interest_offsets"]
         src = np.float32(self.trapezoid)
 
         dst = np.float32([self.trapezoid[0], [self.trapezoid[0][0], 0],
@@ -258,7 +223,20 @@ class Pipeline:
 
     def init_for_file(self, input_file, output_file, mode, exportframes):
 
-        self.results = [[],[]]
+        self.results = [[], []]
+
+        self.diverging_lanes_frames = []
+        self.low_detection_frames = []
+        self.invalid_lane_frames = []
+        self.no_lane_frames = []
+        self.one_lane_frames = []
+        self.converging_lanes_frames = []
+        self.frames_of_interest_summary[input_file] = {"diverging_lanes_frames": self.diverging_lanes_frames,
+                                                       "low_detection_frames": self.low_detection_frames,
+                                                       "invalid_lanes_frames": self.invalid_lane_frames,
+                                                       "no_lane_frames": self.no_lane_frames,
+                                                       "one_lane_frames": self.one_lane_frames
+                                                       }
 
         self.input_file = input_file
         self.output_file = output_file
@@ -282,115 +260,63 @@ class Pipeline:
                  tuple(self.trapezoid[0].astype(int)), color, thickness)
         return img_RGB
 
+    def region_of_interest(self, img, vertices):
+        """
+        Applies an image mask.
+
+        Only keeps the region of the image defined by the polygon
+        formed from `vertices`. The rest of the image is set to black.
+        `vertices` should be a numpy array of integer points.
+        """
+        # defining a blank mask to start with
+        mask = np.zeros_like(img)
+
+        # defining a 3 channel or 1 channel color to fill the mask with depending on the input image
+        if len(img.shape) > 2:
+            channel_count = img.shape[2]  # i.e. 3 or 4 depending on your image
+            ignore_mask_color = (255,) * channel_count
+        else:
+            ignore_mask_color = 255
+
+        vertices = np.array([[vertices]], dtype=np.int32)
+        # filling pixels inside the polygon defined by "vertices" with the fill color
+        cv2.fillPoly(mask, vertices, ignore_mask_color)
+
+        # returning the image only where mask pixels are nonzero
+        masked_image = cv2.bitwise_and(img, mask)
+        return masked_image
+
     def binary_threshold(self, img_RGB):
+
         HLS = cv2.cvtColor(img_RGB, cv2.COLOR_RGB2HLS)
-        gray = cv2.cvtColor(img_RGB, cv2.COLOR_RGB2GRAY)
-        R = img_RGB[:, :, 0]
-        G = img_RGB[:, :, 1]
-        B = img_RGB[:, :, 2]
         H = HLS[:, :, 0]
         L = HLS[:, :, 1]
         S = HLS[:, :, 2]
 
-        H_Sobel = Sobel.mag_thresh(H, sobel_kernel=3, mag_thresh=(30, 100))
+        Hthresh = (0, 100)
+        Sthresh = (100, 255)
+        Lthresh = (200, 255)
 
-        Rthresh = (200, 255)
-        binaryR = np.zeros_like(R)
-        binaryR[(R > Rthresh[0]) & (R <= Rthresh[1])] = 1
+        binaryHLS = np.zeros_like(S)
+        binaryHLS[(((S > Sthresh[0]) & (S <= Sthresh[1])) | (L > Lthresh[0]) & (L <= Lthresh[1])) & (
+                (H > Hthresh[0]) & (H <= Hthresh[1]))] = 255
 
-        Sthresh = (150, 255)
-        binaryS = np.zeros_like(S)
-        binaryS[(S > Sthresh[0]) & (S <= Sthresh[1])] = 1
+        mt = self.trapezoid
+        offsets = self.region_of_interest_offsets
 
-        Hthresh = (20, 70)
-        binaryH = np.zeros_like(H)
-        binaryH[(H > Hthresh[0]) & (H <= Hthresh[1])] = 1
+        to_mask = ((mt[0][0] - offsets[0][0], mt[0][1] + offsets[0][1]),
+                   (mt[1][0] - offsets[1][0], mt[1][1] - offsets[1][1]),
+                   (mt[2][0] + offsets[1][0], mt[2][1] - offsets[1][1]),
+                   (mt[3][0] + offsets[0][0], mt[3][1] + offsets[0][1]))
 
-        return binaryS
+        return self.region_of_interest(binaryHLS, to_mask)
 
-    def perspective_transform(self, img_1C):
-        return cv2.warpPerspective(img_1C, self.transform_matrix, (img_1C.shape[1], img_1C.shape[0]))
+    def perspective_transform(self, img_in):
+        return cv2.warpPerspective(img_in, self.transform_matrix, (img_in.shape[1], img_in.shape[0]))
 
-    def find_lane_pixels(self, binary_warped):
-        # Take a histogram of the bottom half of the image
-        histogram = np.sum(binary_warped[binary_warped.shape[0] // 2:, :], axis=0)
-        # Create an output image to draw on and visualize the result
-        out_img = np.dstack((binary_warped, binary_warped, binary_warped))
-        # Find the peak of the left and right halves of the histogram
-        # These will be the starting point for the left and right lines
-        midpoint = np.int(histogram.shape[0] // 2)
-        leftx_base = np.argmax(histogram[:midpoint])
-        rightx_base = np.argmax(histogram[midpoint:]) + midpoint
-
-        # HYPERPARAMETERS
-        # Choose the number of sliding windows
-        nwindows = 9
-        # Set the width of the windows +/- margin
-        margin = 100
-        # Set minimum number of pixels found to recenter window
-        minpix = 50
-
-        # Set height of windows - based on nwindows above and image shape
-        window_height = np.int(binary_warped.shape[0] // nwindows)
-        # Identify the x and y positions of all nonzero pixels in the image
-        nonzero = binary_warped.nonzero()
-        nonzeroy = np.array(nonzero[0])
-        nonzerox = np.array(nonzero[1])
-        # Current positions to be updated later for each window in nwindows
-        leftx_current = leftx_base
-        rightx_current = rightx_base
-
-        # Create empty lists to receive left and right lane pixel indices
-        left_lane_inds = []
-        right_lane_inds = []
-
-        # Step through the windows one by one
-        for window in range(nwindows):
-            # Identify window boundaries in x and y (and right and left)
-            win_y_low = binary_warped.shape[0] - (window + 1) * window_height
-            win_y_high = binary_warped.shape[0] - window * window_height
-            win_xleft_low = leftx_current - margin
-            win_xleft_high = leftx_current + margin
-            win_xright_low = rightx_current - margin
-            win_xright_high = rightx_current + margin
-
-            # Draw the windows on the visualization image
-            cv2.rectangle(out_img, (win_xleft_low, win_y_low),
-                          (win_xleft_high, win_y_high), (0, 255, 0), 2)
-            cv2.rectangle(out_img, (win_xright_low, win_y_low),
-                          (win_xright_high, win_y_high), (0, 255, 0), 2)
-
-            # Identify the nonzero pixels in x and y within the window #
-            good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
-                              (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
-            good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
-                               (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
-
-            # Append these indices to the lists
-            left_lane_inds.append(good_left_inds)
-            right_lane_inds.append(good_right_inds)
-
-            # If you found > minpix pixels, recenter next window on their mean position
-            if len(good_left_inds) > minpix:
-                leftx_current = np.int(np.mean(nonzerox[good_left_inds]))
-            if len(good_right_inds) > minpix:
-                rightx_current = np.int(np.mean(nonzerox[good_right_inds]))
-
-        # Concatenate the arrays of indices (previously was a list of lists of pixels)
-        try:
-            left_lane_inds = np.concatenate(left_lane_inds)
-            right_lane_inds = np.concatenate(right_lane_inds)
-        except ValueError:
-            # Avoids an error if the above is not implemented fully
-            pass
-
-        # Extract left and right line pixel positions
-        leftx = nonzerox[left_lane_inds]
-        lefty = nonzeroy[left_lane_inds]
-        rightx = nonzerox[right_lane_inds]
-        righty = nonzeroy[right_lane_inds]
-
-        return leftx, lefty, rightx, righty, out_img
+    def inverse_perspective_transform(self, img_in):
+        return cv2.warpPerspective(img_in, self.transform_matrix, (img_in.shape[1], img_in.shape[0]),
+                                   flags=cv2.WARP_INVERSE_MAP)
 
     def naive_find_single_lane(self, lr_ind, topdown, peak):
 
@@ -419,8 +345,7 @@ class Pipeline:
             win_y_high = topdown.shape[0] - window * window_height
             win_x_low = x_current - margin
             win_x_high = x_current + margin
-            res["window_rectangles"].append(((win_x_low, win_y_low),(win_x_high, win_y_high)))
-
+            res["window_rectangles"].append(((win_x_low, win_y_low), (win_x_high, win_y_high)))
 
             # Identify the nonzero pixels in x and y within the window #
             good_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
@@ -445,29 +370,29 @@ class Pipeline:
         res["ys"] = nonzeroy[lane_inds]
         res["detected"] = len(res["xs"])
 
-        # Fit a second order polynomial
-        res["lane_poly"] = np.polyfit(res["ys"], res["xs"], 2)
+        if res["detected"] > self.min_detection:
+            # Fit a second order polynomial
+            res["lane_poly"] = np.polyfit(res["ys"], res["xs"], 2)
 
-        res["fitx"] = res["lane_poly"][0] * ploty ** 2 + res["lane_poly"][1] * ploty + res["lane_poly"][2]
-
-
+            res["fitx"] = res["lane_poly"][0] * ploty ** 2 + res["lane_poly"][1] * ploty + res["lane_poly"][2]
+            res["valid"] = True
+        else:
+            res["valid"] = False
 
         return res
 
-    def naive_visualize_single_lane(self, lr_ind, result, rgb_vis, found_pixels=True, boxes = True, polyline = True):
-
-
+    def naive_visualize_single_lane(self, result, rgb_vis, found_pixels=True, boxes=True, polyline=True):
+        lr_ind = result["lr_ind"]
         if boxes:
             for bt in result["window_rectangles"]:
-                cv2.rectangle(rgb_vis, bt[0],bt[1], self.naive_window_color[lr_ind], 2)
+                cv2.rectangle(rgb_vis, bt[0], bt[1], self.naive_window_color[lr_ind], 2)
 
         if found_pixels:
             rgb_vis[result["ys"], result["xs"]] = self.naive_side_color[lr_ind]
 
         if polyline:
-
-            #plot the polyline
-            offs = 1
+            # plot the polyline
+            offs = 10
             line_window1 = np.array([np.transpose(np.vstack([result["fitx"] - offs, self.ploty]))])
             line_window2 = np.array([np.flipud(np.transpose(np.vstack([result["fitx"] + offs,
                                                                        self.ploty])))])
@@ -476,48 +401,40 @@ class Pipeline:
 
         return rgb_vis
 
-
     def naive_find_lanes(self, lr, topdown):
-        """
-        finds one or two lanes without knowledge from previous frames
-        :param left: if the left lane should be searched
-        :param right: if the right lane should be searched
-        :param topdown: the topdown view of the lanes
-        :param visualize: If True the algorithms is visualized, if false not
-        :param rgb_vis: use this RGB image instead of copying the topdown input
-        :return:
-        """
 
-        midpoint = np.int(topdown.shape[0] // 2)
+        midpoint = np.int(topdown.shape[1] // 2)
         peaks = [False, False]
         if lr[0]:
             # leftside
             histogram = np.sum(topdown[topdown.shape[0] // 2:, 0:midpoint], axis=0)
             peaks[0] = np.argmax(histogram)
+            if (peaks[0] == 0):
+                peaks[0] = int(midpoint / 2)
         if lr[1]:
             # rightside
             histogram = np.sum(topdown[topdown.shape[0] // 2:, midpoint:], axis=0)
             peaks[1] = np.argmax(histogram) + midpoint
-
+            if (peaks[1] == midpoint):
+                peaks[1] = int((midpoint / 2) * 3)
 
         for i in [0, 1]:
             if (lr[i]):
-                res = {"valid": True, "frame_number": self.frame_number, "peak" : peaks[i], "source" : "naive_find_lanes"}
-                res.update(self.naive_find_single_lane(i,topdown,peaks[i]))
+                res = {"frame_number": self.frame_number, "peak": peaks[i], "source": "naive_find_lanes", "lr_ind": i}
+                res.update(self.naive_find_single_lane(i, topdown, peaks[i]))
 
                 self.results[i] = [res] + self.results[i]
                 if len(self.results[i]) > self.remember_results:
                     self.results[i] = self.results[i][0:self.remember_results]
 
-    def poly_find_lanes(self, lr, topdown, search_polys = (None,None)):
+    def poly_find_lanes(self, lr, topdown, search_polys=(None, None)):
         for i in [0, 1]:
-            if  lr[i] :
-                res = {"valid" : True, "frame_number" : self.frame_number, "source" : "poly_find_lanes" }
+            if lr[i]:
+                res = {"valid": True, "frame_number": self.frame_number, "source": "poly_find_lanes", "lr_ind": i}
                 res.update(self.poly_find_single_lane(i, topdown, search_polys[i]))
                 self.results[i] = [res] + self.results[i]
                 if len(self.results[i]) > self.remember_results:
                     self.results[i] = self.results[i][0:self.remember_results]
-
 
     def poly_find_single_lane(self, lr_ind, topdown, search_poly):
 
@@ -535,35 +452,34 @@ class Pipeline:
         ### Hint: consider the window areas for the similarly named variables ###
         ### in the previous quiz, but change the windows to our new search area ###
         res["lane_inds"] = ((nonzerox > (search_poly[0] * (nonzeroy ** 2) + search_poly[1] * nonzeroy +
-                                  search_poly[2] - margin)) & (
-                                 nonzerox < (search_poly[0] * (nonzeroy ** 2) +
-                                             search_poly[1] * nonzeroy + search_poly[
-                                                 2] + margin)))
+                                         search_poly[2] - margin)) & (
+                                    nonzerox < (search_poly[0] * (nonzeroy ** 2) +
+                                                search_poly[1] * nonzeroy + search_poly[
+                                                    2] + margin)))
 
         # Again, extract left and right line pixel positions
-        res["xs"] = nonzerox[res["lane_inds"] ]
-        res["ys"] = nonzeroy[res["lane_inds"] ]
+        res["xs"] = nonzerox[res["lane_inds"]]
+        res["ys"] = nonzeroy[res["lane_inds"]]
 
         res["detected"] = len(res["xs"])
 
-        # Fit new polynomials
-        res["lane_poly"] = np.polyfit(res["ys"] , res["xs"] , 2)
-
-
-        ### TO-DO: Calc both polynomials using ploty, left_fit and right_fit ###
-        res["fitx"] = search_poly[0] * ploty ** 2 + search_poly[1] * ploty + search_poly[2]
-
+        if res["detected"] > self.min_detection:
+            # Fit new polynomials
+            res["lane_poly"] = np.polyfit(res["ys"], res["xs"], 2)
+            res["fitx"] = search_poly[0] * ploty ** 2 + search_poly[1] * ploty + search_poly[2]
+            res["valid"] = True
+        else:
+            res["valid"] = False
         return res
 
-    def poly_visualize_single_lane(self, lr_ind, result, rgb_vis, found_pixels=True, search_area=True, poly_line=True):
-
-
+    def poly_visualize_single_lane(self, result, rgb_vis, found_pixels=True, search_area=True, poly_line=True):
+        lr_ind = result["lr_ind"]
         if search_area:
             # Generate a polygon to illustrate the search window area
             # And recast the x and y points into usable format for cv2.fillPoly()
             line_window1 = np.array([np.transpose(np.vstack([result["fitx"] - self.poly_margin, self.ploty]))])
             line_window2 = np.array([np.flipud(np.transpose(np.vstack([result["fitx"] + self.poly_margin,
-                                                                            self.ploty])))])
+                                                                       self.ploty])))])
             line_pts = np.hstack((line_window1, line_window2))
 
             # Draw the lane onto the warped blank image
@@ -574,7 +490,7 @@ class Pipeline:
 
         if poly_line:
             # Plot the polynomial lines onto the image
-            margin = 2
+            margin = 10
             line_window1 = np.array([np.transpose(np.vstack([result["fitx"] - margin, self.ploty]))])
             line_window2 = np.array([np.flipud(np.transpose(np.vstack([result["fitx"] + margin,
                                                                        self.ploty])))])
@@ -584,24 +500,61 @@ class Pipeline:
 
         return rgb_vis
 
+    def visualize_result(self, result, rgb_vis):
+        if result["source"] == "poly_find_lanes":
+            return self.poly_visualize_single_lane(result, rgb_vis)
+        elif result["source"] == "naive_find_lanes":
+            return self.naive_visualize_single_lane(result, rgb_vis)
+        else:
+            print(f"unknown source for visualizing:{result['source']}")
 
+    def confidence_in_result(self, result):
+        if (result["valid"]):
+            d = self.frame_number - 1 - result["frame_number"]
+            ageing = (1 - self.expire_confidence) / self.expire_results
+            return (result["detected"] / self.max_detection) - d * ageing
+        else:
+            return -1
 
-    def confidence_in_result(self,result):
-        d = self.frame_number -1 - result["frame_number"]
-        ageing = (1-self.expire_confidence)/self.expire_results
-        self.detected.append((result["detected"] / self.max_detection) - d*ageing)
-        return (result["detected"] / self.max_detection) - d*ageing
+    def better_worse(self, a, b):
+        # the more points, the better
+        activated_sum = []
+        # the closer the peak of the poly is to ymax, the better is the quality
+        poly_peak_y = []
+        for a_or_b in (a, b):
+            activated_sum.append(len(a_or_b["ys"]))
+            poly_peak_y.append(-a_or_b["lane_poly"][1] / (2 * a_or_b["lane_poly"][0]))
+
+        activated_sum_ratios = [activated_sum[0] / activated_sum[1], activated_sum[1] / activated_sum[0]]
+        poly_peak_y_ratios = [poly_peak_y[0] / poly_peak_y[1], poly_peak_y[1] / poly_peak_y[0]]
+        if activated_sum_ratios[0] + poly_peak_y_ratios[0] > activated_sum_ratios[1] + poly_peak_y_ratios[1]:
+            return (a, b)
+        else:
+            return (b, a)
+
+    def put_curvature(self, inimg, result_lr):
+        curvats = []
+        curv_centers=[inimg.shape[1]//4,(inimg.shape[1]//4)*3,(inimg.shape[1]//2)]
+        for i in [0, 1]:
+            if result_lr != False:
+                curvats.append(((1 + (2 * result_lr[0]["lane_poly"][0] * self.ploty[-1] * self.curvature_ym_per_pix +
+                                      result_lr[0]["lane_poly"][1]) ** 2) ** 1.5) / np.absolute(
+                    2 * result_lr[0]["lane_poly"][0]))
+        if len(curvats) == 2:
+            curvats.append((curvats[0] + curvats[1]) / 2)
+
+        for center, curv in zip(curv_centers, curvats):
+            # get boundary of this text
+            txt = "{:.2f}".format(curv)
+            textsize = cv2.getTextSize(txt, self.curvature_font, self.curvature_font_scale, 2)[0]
+            cv2.putText(inimg, txt, (center - textsize[0] // 2, textsize[1]), self.curvature_font,
+                        self.curvature_font_scale, (0, 0, 0), 2)
 
     def process(self, inimg):
-
-
-
-
-
         # kick out too old results
         for i in [0, 1]:
             self.results[i] = [a for a in self.results[i] if
-                                     self.frame_number - a["frame_number"] <= self.expire_results]
+                               self.frame_number - a["frame_number"] <= self.expire_results]
 
         stage = {}
         stage['distorted'] = inimg
@@ -618,13 +571,14 @@ class Pipeline:
         self.ploty = np.linspace(0, stage["perspective_transform"].shape[0] - 1,
                                  stage["perspective_transform"].shape[0])
 
+        # decide for each side which algorithm to use for this frame
+        use_poly_find = [False, False]
+        poly_lanes = [False, False]
+        for i in [0, 1]:
 
-        #decide for each side which algorithm to use for this frame
-        use_poly_find = [False,False]
-        poly_lanes = [False,False]
-        for i in [0,1]:
-
-            if len(self.results[i]) > 0 and self.confidence_in_result(self.results[i][0]) > self.search_poly_threshold :
+            if len(self.results[i]) > 0 and not (
+                    "converged_worse" in self.results[i][0].keys()) and self.confidence_in_result(
+                self.results[i][0]) > self.search_poly_threshold:
                 use_poly_find[i] = True
                 poly_lanes[i] = self.results[i][0]["lane_poly"]
             else:
@@ -632,20 +586,58 @@ class Pipeline:
 
         self.poly_find_lanes(use_poly_find, stage["perspective_transform"], poly_lanes)
 
-        self.naive_find_lanes((not(use_poly_find[0]),not(use_poly_find[1])), stage["perspective_transform"])
-
-
-
-        #search the results with the highest confidence for each side and visualize them
+        self.naive_find_lanes((not (use_poly_find[0]), not (use_poly_find[1])), stage["perspective_transform"])
 
         stage["find_lane"] = cv2.cvtColor(stage["perspective_transform"], cv2.COLOR_GRAY2RGB)
 
-        for i in [0,1]:
-            if self.results[i][0]["source"] == "poly_find_lanes":
-                stage["find_lane"] = self.poly_visualize_single_lane(i, self.results[i][0],stage["find_lane"])
-            else:
-                stage["find_lane"]=self.naive_visualize_single_lane(i, self.results[i][0],stage["find_lane"])
+        first_valid_res = [False, False]
+        for i in [0, 1]:
+            first_valid_res[i] = next((r for r in self.results[i] if r["valid"]), False)
 
+        if first_valid_res == [False, False]:
+            print("no valid lanes, neither left or right, nothing to visualize")
+            self.no_lane_frames.append(self.frame_number)
+        elif first_valid_res[0] != False and first_valid_res[1] != False:
+            # two valid results, great
+            curve_same_way = first_valid_res[0]["lane_poly"][0] > 0 == first_valid_res[1]["lane_poly"][0] > 0
+            curve_diff = abs(first_valid_res[0]["lane_poly"][0] - first_valid_res[1]["lane_poly"][0])
+            self.poly_summary.append((first_valid_res[0]["lane_poly"][0], first_valid_res[1]["lane_poly"][0]))
+            if curve_same_way and curve_diff > self.diverging_lanes_threshold:
+                # the lanes diverge enough to be inspected for correction
+                self.diverging_lanes_frames.append(self.frame_number)
+            elif not curve_same_way and curve_diff > self.converging_lanes_threshold:
+                # the lanes converge enough to be inspected for correction
+                self.converging_lanes_frames.append(self.frame_number)
+                better, worse = self.better_worse(first_valid_res[0], first_valid_res[1])
+
+                # calculate average fitx for the frames before this frame
+                fitx_sum = 0
+                fitx_valids = 0
+                for resf in self.results[worse["lr_ind"]]:
+                    if resf["valid"]:
+                        fitx_valids = fitx_valids + 1
+                        fitx_sum = fitx_sum + resf["fitx"][-1]
+                worse["fitx"] = better["fitx"] - better["fitx"][-1] + fitx_sum / fitx_valids
+                # we mark it
+                worse["converged_worse"] = True
+                better["converged_better"] = True
+
+
+            for res in first_valid_res:
+                stage["find_lane"] = self.visualize_result(res, stage["find_lane"])
+        else:
+            # one valid lane
+            self.one_lane_frames.append(self.frame_number)
+            for res in first_valid_res:
+                if res != False:
+                    stage["find_lane"] = self.visualize_result(res, stage["find_lane"])
+
+        stage["inverse_perspective_transform"] = self.inverse_perspective_transform(stage["find_lane"])
+
+        stage["final_result"] = stage['undistorted'].copy()
+        stage["final_result"][stage["inverse_perspective_transform"] > 0] = 0
+        self.put_curvature(stage["final_result"], first_valid_res)
+        stage["final_result"] = stage["final_result"] + stage["inverse_perspective_transform"]
 
         if (self.mode == "image"):
             for st in self.stage_output:
@@ -669,7 +661,7 @@ class Pipeline:
                                               + '.' + str(self.frame_number) + '.' + st + ".jpg"), out_img)
 
         self.frame_number = self.frame_number + 1
-        return stage["find_lane"]
+        return stage["final_result"]
 
 
 def configure():
@@ -682,64 +674,79 @@ def configure():
     # first number initial calibration, second number calibration failures on undistorted images
     pipeline_config["camera"]["chessboard_accepted_failures"] = [3, 4]
 
-
-
     # gimp coordinates, clockwise, bottom left first, taken from thresholded image
     measured_trapezoid = [
         (194, 719), (581, 460),
         (702, 460), (1115, 719)
     ]
 
-
+    # this is the trapezoid to later use for perspective transform
+    # point[1] and point[2] are projected to y = 0 and the x of point[0] and point[3]
     pipeline_config["trapezoid"] = measured_trapezoid
 
-    #how many results to keep
+    pipeline_config["region_of_interest_offsets"] = ((100, 0), (30, 30))
+    # how many results to keep
     pipeline_config["remember_results"] = 5
 
-    #when to expire results
+    # when to expire results
     pipeline_config["expire_results"] = 25
 
-    #how much confidence in a result which will expire next frame
+    # how much confidence in a result which will expire next frame
     pipeline_config["expire_confidence"] = 0
 
-    #how many pixels in a perfectly identified lane
+    # how many pixels in a perfectly identified lane
     pipeline_config["max_detection"] = 20000
 
-    #how high must the confidence of a fitted polygon be to go from naive finding to poly finding
-    pipeline_config["search_poly_threshold"] = 0.5
+    # how many pixels before even trying to fit a polynomial
+    pipeline_config["min_detection"] = 100
 
+    # how high must the confidence of a fitted polygon be to go from naive finding to poly finding
+    pipeline_config["search_poly_threshold"] = 0.2
 
-    pipeline_config["naive_windows"] = 9
-    pipeline_config["naive_margin"] = 100
-    pipeline_config["naive_minpix"] = 50
+    pipeline_config["converging_lanes_threshold"] = 0.001
+    pipeline_config["diverging_lanes_threshold"] = 0.001
+
+    pipeline_config["naive_windows"] = 12
+    pipeline_config["naive_margin"] = 160
+    pipeline_config["naive_minpix"] = 40
     pipeline_config["naive_window_color"] = ((0, 255, 0), (0, 255, 0))
     pipeline_config["naive_side_color"] = ((0, 255, 0), (255, 0, 0))
     pipeline_config["naive_polyline_color"] = ((255, 255, 0), (255, 255, 0))
 
-    pipeline_config["poly_margin"] = 100
+    pipeline_config["poly_margin"] = 80
     pipeline_config["poly_search_color"] = ((30, 151, 227), (30, 151, 227))
     pipeline_config["poly_side_color"] = ((255, 0, 230), (255, 23, 42))
     pipeline_config["poly_polyline_color"] = ((255, 111, 0), (255, 111, 0))
 
+    pipeline_config["curvature_font"] = cv2.FONT_HERSHEY_SIMPLEX
+    pipeline_config["curvature_font_scale"] = 1
 
+    # Define conversions in x and y from pixels space to meters
+    pipeline_config["curvature_ym_per_pix"] = 30 / 720  # meters per pixel in y dimension
+    pipeline_config["curvature_xm_per_pix"] = 3.7 / 700  # meters per pixel in x dimension
     pipeline_config["output"] = {}
     pipeline_config["output"]["image"] = {}
     # possible stages are: ['undistorted','bin_thresh']
-    pipeline_config["output"]["image"]["stages"] = ["undistorted", "find_lane", "perspective_transform"]
+    pipeline_config["output"]["image"]["stages"] = ["undistorted", "find_lane", "perspective_transform", "find_lane"]
     pipeline_config["output"]["video"] = {}
     # this only affects exported single frames, see the last tuple of each videopath
-    pipeline_config["output"]["video"]["stages"] = ["undistorted", "find_lane", "perspective_transform"]
+    pipeline_config["output"]["video"]["stages"] = ["undistorted", "bin_thresh", "perspective_transform", "find_lane"]
 
     imgpaths = []
     for p in glob.glob("test_images/*"):
         imgpaths.append((p, os.path.join("test_images_output", os.path.basename(p))))
 
-    pipeline_config["image_paths"] = imgpaths
-
-    pipeline_config["video_paths"] = [("project_video.mp4", "output_videos/project_video_out.mp4", (0,5), (10,50,250))]
+    # pipeline_config["image_paths"] = imgpaths
+    # (input, output, (start,stop),(export_frames)
+    pipeline_config["video_paths"] = [
+        ("project_video.mp4", "output_videos/project_video_out.mp4", False, False)]
     return pipeline_config
 
 
 pl = Pipeline(configure())
 pl.start()
-print(pl.detected)
+print(f"invalid_lane_frames: {pl.invalid_lane_frames}")
+print(f"diverging_lane_frames: {pl.diverging_lanes_frames}")
+print(f"converging_lane_frames: {pl.converging_lanes_frames}")
+print(f"no_lane_frames: {pl.no_lane_frames}")
+print(f"one_lane_frames: {pl.one_lane_frames}")
