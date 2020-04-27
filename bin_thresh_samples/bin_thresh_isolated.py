@@ -117,13 +117,14 @@ def binary_threshold(img_RGB):
     Sthresh = (100, 255)
     Lthresh = (200, 255)
     Hthresh = (0, 100)
-    binaryLSH = np.zeros_like(S)
-    binaryLSH[(((S > Sthresh[0]) & (S <= Sthresh[1])) | (L > Lthresh[0]) & (L <= Lthresh[1])) & (
-                (H > Hthresh[0]) & (H <= Hthresh[1]))] = 255
+    BThresh = (220,255)
+    binary = np.zeros_like(S)
+    binary[(((S > Sthresh[0]) & (S <= Sthresh[1])) | (L > Lthresh[0]) & (L <= Lthresh[1])) & (
+                (H > Hthresh[0]) & (H <= Hthresh[1])) | (B>BThresh[0]) & (B<BThresh[1])] = 255
     #sobelMagLS = Sobel.mag_thresh(binaryLS, sobel_kernel=3, mag_thresh=(80, 255))
     #sobelDirLS = Sobel.dir_threshold(binaryLS, sobel_kernel=5, thresh=((np.pi / 2) * (1 / 3), (np.pi / 2) * (2 / 3)))
 
-    return region_of_interest(binaryLSH, np.array([[to_mask]], dtype=np.int32))
+    return region_of_interest(binary, np.array([[to_mask]], dtype=np.int32))
 
 
 Path("bin_thresh_out/").mkdir(parents=True, exist_ok=True)

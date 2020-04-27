@@ -1,12 +1,7 @@
-## Writeup Template
-
-### You can use this file as a template for your writeup if you want to submit it as a markdown file, but feel free to use some other method and submit a pdf if you prefer.
-
----
 
 **Advanced Lane Finding Project**
 
-The goals / steps of this project are the following:
+The techniques employed in this project are the following:
 
 * Compute the camera calibration matrix and distortion coefficients given a set of chessboard images.
 * Apply a distortion correction to raw images.
@@ -17,46 +12,75 @@ The goals / steps of this project are the following:
 * Warp the detected lane boundaries back onto the original image.
 * Output visual display of the lane boundaries and numerical estimation of lane curvature and vehicle position.
 
-[//]: # (Image References)
+### Writeup
 
-[image1]: ./examples/undistort_output.png "Undistorted"
-[image2]: ./test_images/test1.jpg "Road Transformed"
-[image3]: ./examples/binary_combo_example.jpg "Binary Example"
-[image4]: ./examples/warped_straight_lines.jpg "Warp Example"
-[image5]: ./examples/color_fit_lines.jpg "Fit Visual"
-[image6]: ./examples/example_output.jpg "Output"
-[video1]: ./project_video.mp4 "Video"
+#### Overview
+All relevant code resides in alfp.py.
+Input and output settings can be directly set in `Pipeline.___init___`.
+`Pipeline.image_paths` and `Pipeline.video_paths` are tuple-based, which allows `Pipeline.video_paths`
+to also handle subclips and exporting single frames from videos.
+`Pipeline.process_result` can be altered to export other stages to an output video.
+The best usage is to alter it to `'all_vis'`, which not only displays the calculated lane, but also which algorithm
+for finding lane marking pixels was used (sliding window or search poly).
 
-## [Rubric](https://review.udacity.com/#!/rubrics/571/view) Points
+Parameters are contained in `Pipeline.___init___` or as static (class) variables on `LaneMarking`.
 
-### Here I will consider the rubric points individually and describe how I addressed each point in my implementation.  
-
----
-
-### Writeup / README
-
-#### 1. Provide a Writeup / README that includes all the rubric points and how you addressed each one.  You can submit your writeup as markdown or pdf.  [Here](https://github.com/udacity/CarND-Advanced-Lane-Lines/blob/master/writeup_template.md) is a template writeup for this project you can use as a guide and a starting point.  
-
-You're reading it!
 
 ### Camera Calibration
 
-#### 1. Briefly state how you computed the camera matrix and distortion coefficients. Provide an example of a distortion corrected calibration image.
+The functionality to do camera calibration is located in its own class `Camera`.
+`Camera.__init__` encapsulates all required parametrization.
+Instances expose the `undistort` method, which allows undistorting images.
+The class also has an experimental feature for selftesting the calibration result.
+The idea was to compare calibration results from distorted chessboard images and
+undistorted chessboard images and then compare the results.
+The calibration on undistorted images was expected to yield *lower* correction values,
+but this feature did not reach an usable state, but can be seen in `Camera.selftest`.
+Pictures with chessboard corners can be exported by setting `Camera.calibration_chessboard_path`
+to a directory.
+![a chessboard image](/chessboard/calibration2.corners.jpg "a chessboard image")
 
-The code for this step is contained in the first code cell of the IPython notebook located in "./examples/example.ipynb" (or in lines # through # of the file called `some_file.py`).  
+During development it was identified that `calibration1.jpg`, `calibration4.jpg` and `calibration5.jpg`
+do not show the chessboard pattern completely. `Camera.calibrate` tries to use 
+them for calibration but fails silently. `Camera.chessboard_notfound` can be inspected
+on `Camera` instances.
 
-I start by preparing "object points", which will be the (x, y, z) coordinates of the chessboard corners in the world. Here I am assuming the chessboard is fixed on the (x, y) plane at z=0, such that the object points are the same for each calibration image.  Thus, `objp` is just a replicated array of coordinates, and `objpoints` will be appended with a copy of it every time I successfully detect all chessboard corners in a test image.  `imgpoints` will be appended with the (x, y) pixel position of each of the corners in the image plane with each successful chessboard detection.  
+In general `Camera` can be instantiated separately from `Pipeline` if needed.
+`Camera` is only instantiated once per `Pipeline` and each `Pipeline` instance can handle
+multiple images and videos.
 
-I then used the output `objpoints` and `imgpoints` to compute the camera calibration and distortion coefficients using the `cv2.calibrateCamera()` function.  I applied this distortion correction to the test image using the `cv2.undistort()` function and obtained this result: 
+### Pipeline
+The **a**dvanced **l**ane **f**inding **p**ipeline (hence the filename `alfp.py`) has four phases.
++ `Pipeline.__init__` contains the necessary configuration, instantiates a `Camera` and calculates the transformation
+matrix for perspective transformation.
 
-![alt text][image1]
++ `Pipeline.start` must be called from the outside. The processing does not start directly at the of the constructor.
+This allows for experimentation to manipulate the `Pipeline` instance
+`Pipeline.start` then iterates through all files and calls `Pipeline.init_for_file` for each file.
+`Pipeline.init_for_file` takes resets changing values of the pipeline, so a new file can be processed.
 
-### Pipeline (single images)
++ The actual processing of images is then done in `Pipeline.process`  
 
-#### 1. Provide an example of a distortion-corrected image.
+`Pipeline.process` internally produces intermediate images for each stage which can be easily exported.
+The available stage-outputs are
++ 'distorted' is identical to the input image
++ 'undistorted' is undistorted by `Camera.undistort`
++ 'trapezoid' shows the trapezoid super imposed on the input image.
+This is merely for visualization and debugging and not fed into further pipeline stages.
++ 'bin_thresh' shows which pixels are activated for lanefinding. `Pipeline.binary_threshold` creates this output.
++ 'perspective_transform' is the output of the perspective transform. The trapezoid is transformed into a topdown
+view by `Pipeline.perspective_transform`
++ 'find_lane' shows the output of the lane finding of this frame. The pipeline does only one lane finding run per
+side, which can either be done by `LaneMarking.find_by_sliding_windows` and `LaneMarking.find_by_poly`
++ 'inverse_perspective_transform' is 'find_lane' transformed back into the initial perspective.
++ 'all_vis' combines all visualizations and includes the curvatures for both lane markings and the position of the
+vehicle within the lane. 'all_vis' is an alternative to 'lanearea'
++ 'lanearea' only displays the calculated curvatures, position within the lane and the lane area.
 
-To demonstrate this step, I will describe how I apply the distortion correction to one of the test images like this one:
-![alt text][image2]
+#### Distortion removal
+
+Distortion is removed by calling `Camera.undistort`.
+
 
 #### 2. Describe how (and identify where in your code) you used color transforms, gradients or other methods to create a thresholded binary image.  Provide an example of a binary image result.
 
