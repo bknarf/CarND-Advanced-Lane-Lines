@@ -150,10 +150,10 @@ class LaneMarking():
     sidecolor = ((82, 170, 94)[::-1], (127, 85, 125)[::-1])
     linecolor = ((255, 0, 0)[::-1], (255, 0, 0)[::-1])
     lanewidth = 10
-    lanearea_color = (255, 226, 255)[::-1]
+    lanearea_color = (220, 220, 220)[::-1]
 
-    curvature_ym_per_pix = 30 / 720  # meters per pixel in y dimension
-    curvature_xm_per_pix = 3.7 / 700  # meters per pixel in x dimension
+    ym_per_pix = 30 / 720  # meters per pixel in y dimension
+    xm_per_pix = 3.7 / 892  # meters per pixel in x dimension
     curvature_font = cv2.FONT_HERSHEY_SIMPLEX
     curvature_fontscale = 1
 
@@ -357,14 +357,14 @@ class LaneMarking():
             c = [0, 0]
             x = [0, 0]
             for i in [0, 1]:
-                c[i] = ((1 + (2 * l[i].poly[0] * (inimg.shape[0] - 1) * LaneMarking.curvature_ym_per_pix +
-                              l[i].poly[1]) ** 2) ** 1.5) / np.absolute(2 * l[i].poly[0])
+                c[i] = ((1 + (2 * l[i].poly[0] * (inimg.shape[0] - 1) * self.ym_per_pix + l[i].poly[
+                    1]) ** 2) ** 1.5) / np.absolute(2 * l[i].poly[0])
                 x[i] = l[i].fitted_x(inimg.shape[0] - 1)
 
             # put the curvatures
             for center, curv in zip(curvature_text_centers, c):
                 if curv:
-                    txt = "{:.2f}".format(curv)
+                    txt = "{:.1f}km".format(round(curv / 100) / 10)
                     # get boundary of this text
                     textsize = cv2.getTextSize(txt, LaneMarking.curvature_font, LaneMarking.curvature_fontscale, 2)[
                         0]
@@ -372,13 +372,14 @@ class LaneMarking():
                                 LaneMarking.curvature_font,
                                 LaneMarking.curvature_fontscale, (0, 0, 0), 2)
 
-            x_mean = np.average(x)
-            if x_mean > inimg.shape[0] / 2:
-                postext = "{:.2f} left of center".format(
-                    (x_mean - inimg.shape[0] / 2) * LaneMarking.curvature_xm_per_pix)
+            x_middle = (x[0] + x[1]) / 2
+
+            if x_middle > inimg.shape[1] / 2:
+                postext = "{:.2f}m left of center".format(
+                    (x_middle - inimg.shape[1] / 2) * LaneMarking.xm_per_pix)
             else:
-                postext = "{:.2f} right of center".format(
-                    (inimg.shape[0] / 2 - x_mean) * LaneMarking.curvature_xm_per_pix)
+                postext = "{:.2f}m right of center".format(
+                    (inimg.shape[1] / 2 - x_middle) * LaneMarking.xm_per_pix)
 
             # get boundary of this text
             postextsize = cv2.getTextSize(postext, LaneMarking.curvature_font, LaneMarking.curvature_fontscale, 2)[
@@ -405,10 +406,14 @@ class Pipeline:
         # gimp coordinates, clockwise, bottom left first, taken from thresholded image
         # this is the trapezoid to later use for perspective transform
         # point[1] and point[2] are projected to y = 0 and the x of point[0] and point[3]
-        self.trapezoid = [
-            (194, 719), (581, 460),
-            (702, 460), (1115, 719)
-        ]
+        self.trapezoid = [(194, 719), (581, 460), (699, 460), (1086, 719)]
+        # set up the perspective transform
+        src = np.float32(self.trapezoid)
+
+        dst = np.float32([self.trapezoid[0], [self.trapezoid[0][0], 0],
+                          [self.trapezoid[3][0], 0], self.trapezoid[3]])
+
+        self.transform_matrix = cv2.getPerspectiveTransform(src, dst)
 
         self.trapezoid_color = [161, 16, 112]
 
@@ -434,21 +439,15 @@ class Pipeline:
         # pipeline_config["image_paths"] = imgpaths
         # (input, output, (start,stop),(export_frames)
         self.video_paths = [
-            ("project_video.mp4", "output_videos/project_video_out.mp4", (0,2), (100, 500, 1047, 1500, 2000)),
-            ("challenge_video.mp4", "output_videos/challenge_video_out.mp4", (0,2), (100, 500, 1047, 1500, 2000)),
-            ("harder_challenge_video.mp4", "output_videos/harder_challenge_video.mp4", (0,2),
+            ("project_video.mp4", "output_videos/project_video_out.mp4", False, (100, 500, 1047, 1500, 2000)),
+            ("challenge_video.mp4", "output_videos/challenge_video_out.mp4", False, (100, 500, 1047, 1500, 2000)),
+            ("harder_challenge_video.mp4", "output_videos/harder_challenge_video.mp4", False,
              (100, 500, 1047, 1500, 2000))
         ]
 
         self.exportframes = []
 
-        # set up the perspective transform
-        src = np.float32(self.trapezoid)
 
-        dst = np.float32([self.trapezoid[0], [self.trapezoid[0][0], 0],
-                          [self.trapezoid[3][0], 0], self.trapezoid[3]])
-
-        self.transform_matrix = cv2.getPerspectiveTransform(src, dst)
 
     def start(self):
 
@@ -665,5 +664,6 @@ class Pipeline:
         return cv2.cvtColor(stage[self.process_result], cv2.COLOR_BGR2RGB)
 
 
+Camera().undistort()
 pl = Pipeline()
 pl.start()
